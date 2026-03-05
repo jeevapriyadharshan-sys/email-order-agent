@@ -104,14 +104,8 @@ def _ensure_human_review_row(db: Session, email_id: int) -> None:
         db.commit()
 
 
-def _create_order(db: Session, em: EmailMessage) -> Order:
-    # If order already exists, return it
-    existing = db.query(Order).filter(Order.email_id == em.id).first()
-    if existing:
-        return existing
-
+def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
     ex = em.extracted or {}
-    job_id = f"JOB-{_now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
 
     w = ex.get("weight_kg")
     try:
@@ -119,6 +113,21 @@ def _create_order(db: Session, em: EmailMessage) -> Order:
     except Exception:
         weight_int = 0
 
+    existing = db.query(Order).filter(Order.email_id == em.id).first()
+
+    if existing:
+        # UPDATE existing order
+        existing.customer_name = str(ex.get("customer_name", "")).strip()
+        existing.weight_kg = weight_int
+        existing.pickup_location = str(ex.get("pickup_location", "")).strip()
+        existing.drop_location = str(ex.get("drop_location", "")).strip()
+        existing.pickup_time_window = str(ex.get("pickup_time_window", "")).strip()
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    # CREATE new order
+    job_id = f"JOB-{_now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
     order = Order(
         job_id=job_id,
         email_id=em.id,
@@ -296,7 +305,8 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
         db.commit()
 
         text = em.body_text or ""
-        extracted: Dict[str, Any] = {}
+# ✅ Start from whatever we already know (human review / previous run)
+        extracted: Dict[str, Any] = dict(em.extracted or {})
 
         # --- Layer 1: Regex ---
         try:
@@ -365,7 +375,7 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
         em.status = EmailStatus.READY_TO_CONFIRM
         db.commit()
 
-        order = _create_order(db, em)
+        order = _create_or_update_order(db, em)
         em.status = EmailStatus.ORDER_CREATED
 
         # ✅ Archive once order is created (requires emails.archived column + model field)
