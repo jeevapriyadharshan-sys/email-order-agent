@@ -1,9 +1,10 @@
-import smtplib
-import ssl
-from email.mime.text import MIMEText
+import os
 from typing import Optional
 
-SMTP_TIMEOUT = 10  # seconds
+try:
+    import resend
+except ImportError:
+    resend = None  # type: ignore
 
 
 def send_confirmation(
@@ -18,37 +19,32 @@ def send_confirmation(
     smtp_from: Optional[str] = None,
 ):
     """
-    Generic SMTP sender used for:
-    - reconfirmation email (order created)
-    - missing-fields request email (human review)
-    Supports both SSL (port 465) and STARTTLS (port 587).
+    Sends email via Resend API (HTTP-based, works on Render free tier).
+    Falls back gracefully if RESEND_API_KEY is not set.
     """
 
-    if not smtp_host or not to_addr:
+    if not to_addr:
         return
 
     from_final = (from_addr or smtp_from or smtp_user or "").strip()
     if not from_final:
         return
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["From"] = from_final
-    msg["To"] = to_addr
-    msg["Subject"] = subject
+    resend_api_key = os.environ.get("RESEND_API_KEY", "")
 
-    context = ssl.create_default_context()
+    if not resend_api_key:
+        raise RuntimeError("RESEND_API_KEY is not set. Cannot send email.")
 
-    # Use SSL (port 465) or STARTTLS (port 587)
-    if smtp_port == 465:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=SMTP_TIMEOUT) as server:
-            if smtp_user:
-                server.login(smtp_user, smtp_password)
-            server.sendmail(from_final, [to_addr], msg.as_string())
-    else:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=SMTP_TIMEOUT) as server:
-            server.ehlo()
-            server.starttls(context=context)
-            server.ehlo()
-            if smtp_user:
-                server.login(smtp_user, smtp_password)
-            server.sendmail(from_final, [to_addr], msg.as_string())
+    if resend is None:
+        raise RuntimeError("resend package is not installed. Run: pip install resend")
+
+    resend.api_key = resend_api_key
+
+    params = {
+        "from": from_final,
+        "to": [to_addr],
+        "subject": subject,
+        "text": body,
+    }
+
+    resend.Emails.send(params)
