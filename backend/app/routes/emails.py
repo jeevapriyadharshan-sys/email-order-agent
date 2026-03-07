@@ -43,14 +43,8 @@ def inbox(
     limit: int = Query(100, ge=1, le=500),
     include_processing: bool = Query(True, description="Include RECEIVED/EXTRACTING/READY_TO_CONFIRM"),
 ):
-    """
-    Inbox should NOT stack forever.
-    - Shows only non-archived emails.
-    - Default shows active statuses (RECEIVED/EXTRACTING/NEEDS_HUMAN_REVIEW/READY_TO_CONFIRM).
-    """
     q = db.query(EmailMessage)
 
-    # Hide archived items (if column exists)
     if _has_archived_column():
         q = q.filter(EmailMessage.archived == False)  # noqa: E712
 
@@ -72,16 +66,11 @@ def processed(
     user=Depends(get_current_user),
     limit: int = Query(200, ge=1, le=1000),
 ):
-    """
-    Processed emails (archived=True). These are ones for which order creation is done
-    (or at least the workflow decided to archive them).
-    """
     q = db.query(EmailMessage)
 
     if _has_archived_column():
         q = q.filter(EmailMessage.archived == True)  # noqa: E712
     else:
-        # If archived column doesn't exist yet, fall back to showing completed statuses.
         q = q.filter(EmailMessage.status.in_([EmailStatus.ORDER_CREATED, EmailStatus.CONFIRMATION_SENT]))
 
     items = q.order_by(EmailMessage.received_at.desc()).limit(limit).all()
@@ -104,7 +93,7 @@ def get_email(
 
 
 # ---------------------------
-# Trigger processing manually
+# Trigger processing manually (direct call, no Celery)
 # ---------------------------
 @router.post("/{email_id}/process", response_model=None)
 def process_email_now(
@@ -116,13 +105,13 @@ def process_email_now(
     if not em:
         raise HTTPException(status_code=404, detail="Email not found")
 
-    # Queue background processing
-    process_email_task.delay(email_id)
+    # Direct call instead of .delay()
+    process_email_task(email_id)
     return {"ok": True, "message": "Processing started", "email_id": email_id}
 
 
 # ---------------------------
-# Optional: Archive/unarchive manually (nice for ops)
+# Optional: Archive/unarchive manually
 # ---------------------------
 @router.post("/{email_id}/archive", response_model=None)
 def archive_email(
