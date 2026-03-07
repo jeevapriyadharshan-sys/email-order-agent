@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from celery import Celery
+from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -22,28 +22,34 @@ except Exception:
     extract_with_gemini = None  # type: ignore
 
 
-celery_app = Celery(
-    "email_order_agent",
-    broker=settings.REDIS_URL,
-    backend=settings.REDIS_URL,
-)
+# ---------------------------------------------------------------------------
+# APScheduler setup (replaces Celery Beat)
+# ---------------------------------------------------------------------------
+scheduler = BackgroundScheduler(timezone="UTC")
 
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
-)
 
-# ✅ Beat schedule so agent runs automatically
-celery_app.conf.beat_schedule = {
-    "agent-tick-every-15-seconds": {
-        "task": "app.worker.agent_tick",
-        "schedule": 15.0,
-    }
-}
+def start_scheduler() -> None:
+    """Call this once on FastAPI startup."""
+    if not scheduler.running:
+        scheduler.add_job(
+            agent_tick,
+            trigger="interval",
+            seconds=15,
+            id="agent-tick",
+            replace_existing=True,
+        )
+        scheduler.start()
 
+
+def stop_scheduler() -> None:
+    """Call this on FastAPI shutdown."""
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+
+
+# ---------------------------------------------------------------------------
+# Helpers (unchanged from original)
+# ---------------------------------------------------------------------------
 REQUIRED_FIELDS = [
     "customer_name",
     "weight_kg",
@@ -60,7 +66,6 @@ def _now() -> datetime:
 def _safe_json(obj: Any) -> Any:
     try:
         import json
-
         json.dumps(obj)
         return obj
     except Exception:
@@ -116,7 +121,6 @@ def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
     existing = db.query(Order).filter(Order.email_id == em.id).first()
 
     if existing:
-        # UPDATE existing order
         existing.customer_name = str(ex.get("customer_name", "")).strip()
         existing.weight_kg = weight_int
         existing.pickup_location = str(ex.get("pickup_location", "")).strip()
@@ -126,7 +130,6 @@ def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
         db.refresh(existing)
         return existing
 
-    # CREATE new order
     job_id = f"JOB-{_now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
     order = Order(
         job_id=job_id,
@@ -144,10 +147,6 @@ def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
 
 
 def _send_confirmation(db: Session, em: EmailMessage, order: Order) -> None:
-    """
-    If SMTP fails or not configured, DO NOT fail the email.
-    Just write last_error and keep status ORDER_CREATED.
-    """
     if not (settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASSWORD):
         em.last_error = (em.last_error + "\n" if em.last_error else "") + "SMTP not configured; confirmation skipped."
         db.commit()
@@ -193,11 +192,6 @@ def _send_confirmation(db: Session, em: EmailMessage, order: Order) -> None:
 
 
 def _send_missing_fields_request(db: Session, em: EmailMessage, missing: List[str]) -> None:
-    """
-    Send an email back to the sender listing missing fields.
-    Will only send once per email using em.missing_request_sent.
-    """
-    # If SMTP not configured, skip silently (but do not fail pipeline)
     if not (settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASSWORD):
         em.last_error = (em.last_error + "\n" if em.last_error else "") + "SMTP not configured; missing-fields request skipped."
         db.commit()
@@ -237,7 +231,6 @@ def _send_missing_fields_request(db: Session, em: EmailMessage, missing: List[st
             subject=subject,
             body=body,
         )
-        # mark as sent to avoid spamming
         if hasattr(em, "missing_request_sent"):
             em.missing_request_sent = True
         db.commit()
@@ -246,7 +239,10 @@ def _send_missing_fields_request(db: Session, em: EmailMessage, missing: List[st
         db.commit()
 
 
-@celery_app.task(name="app.worker.ingest_emails_task")
+# ---------------------------------------------------------------------------
+# Core tasks (now plain functions, no Celery decorators)
+# ---------------------------------------------------------------------------
+
 def ingest_emails_task() -> Dict[str, Any]:
     db = SessionLocal()
     try:
@@ -283,7 +279,8 @@ def ingest_emails_task() -> Dict[str, Any]:
             db.refresh(em)
             inserted += 1
 
-            process_email_task.delay(em.id)
+            # Call directly instead of .delay()
+            process_email_task(em.id)
 
         return {"ok": True, "inserted": inserted, "skipped": skipped}
     except Exception as e:
@@ -292,7 +289,6 @@ def ingest_emails_task() -> Dict[str, Any]:
         db.close()
 
 
-@celery_app.task(name="app.worker.process_email_task")
 def process_email_task(email_id: int) -> Dict[str, Any]:
     db = SessionLocal()
     try:
@@ -305,14 +301,12 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
         db.commit()
 
         text = em.body_text or ""
-# ✅ Start from whatever we already know (human review / previous run)
         extracted: Dict[str, Any] = dict(em.extracted or {})
 
         # --- Layer 1: Regex ---
         try:
             rex = extract_with_regex(text) or {}
             extracted = _merge(extracted, rex)
-
             db.add(
                 ExtractionRun(
                     email_id=em.id,
@@ -340,7 +334,6 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
                 ) or {}
                 extracted = _merge(extracted, gem)
                 missing = _missing_fields(extracted)
-
                 db.add(
                     ExtractionRun(
                         email_id=em.id,
@@ -355,36 +348,28 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
                 em.last_error = (em.last_error + "\n" if em.last_error else "") + f"Gemini skipped: {str(e)}"
                 db.commit()
 
-        # Save extraction output
         em.extracted = extracted
         em.missing_fields = missing
         db.commit()
 
-        # If missing → human review + email user missing details (once)
         if missing:
             em.status = EmailStatus.NEEDS_HUMAN_REVIEW
             db.commit()
-
             if not getattr(em, "missing_request_sent", False):
                 _send_missing_fields_request(db, em, missing)
-
             _ensure_human_review_row(db, em.id)
             return {"ok": True, "status": em.status, "missing_fields": missing}
 
-        # Complete → create order
         em.status = EmailStatus.READY_TO_CONFIRM
         db.commit()
 
         order = _create_or_update_order(db, em)
         em.status = EmailStatus.ORDER_CREATED
 
-        # ✅ Archive once order is created (requires emails.archived column + model field)
         if hasattr(em, "archived"):
             em.archived = True
-
         db.commit()
 
-        # Send confirmation (optional; never FAIL the email)
         _send_confirmation(db, em, order)
 
         return {"ok": True, "status": em.status, "job_id": order.job_id}
@@ -402,7 +387,6 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
         db.close()
 
 
-@celery_app.task(name="app.worker.agent_tick")
 def agent_tick() -> Dict[str, Any]:
     db = SessionLocal()
     try:
