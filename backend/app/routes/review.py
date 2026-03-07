@@ -81,8 +81,8 @@ def submit_review(
     db.add(hr)
     db.commit()
 
-    # If complete, continue pipeline
+    # If complete, continue pipeline (direct call, no Celery)
     if em.status == EmailStatus.READY_TO_CONFIRM:
-        process_email_task.delay(email_id)
+        process_email_task(email_id)
 
     return {"ok": True, "status": em.status, "missing_fields": em.missing_fields}
