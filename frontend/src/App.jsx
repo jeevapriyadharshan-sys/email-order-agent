@@ -20,13 +20,12 @@ export default function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<Login />} />
-
         <Route
           path="/*"
           element={
             <Private>
               <Nav />
-              <div style={{ padding: 16, maxWidth: 1100, margin: "0 auto" }}>
+              <div className="pageContent">
                 <Routes>
                   <Route path="/" element={<Dashboard />} />
                   <Route path="/inbox" element={<Inbox />} />
