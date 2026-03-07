@@ -1,4 +1,5 @@
 import smtplib
+import ssl
 from email.mime.text import MIMEText
 from typing import Optional
 
@@ -12,12 +13,13 @@ def send_confirmation(
     subject: str,
     body: str,
     from_addr: Optional[str] = None,
-    smtp_from: Optional[str] = None,  # accept old keyword too
+    smtp_from: Optional[str] = None,
 ):
     """
     Generic SMTP sender used for:
     - reconfirmation email (order created)
     - missing-fields request email (human review)
+    Supports both SSL (port 465) and STARTTLS (port 587).
     """
 
     if not smtp_host or not to_addr:
@@ -32,8 +34,19 @@ def send_confirmation(
     msg["To"] = to_addr
     msg["Subject"] = subject
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        if smtp_user:
-            server.login(smtp_user, smtp_password)
-        server.sendmail(from_final, [to_addr], msg.as_string())
+    context = ssl.create_default_context()
+
+    # Use SSL (port 465) or STARTTLS (port 587)
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
+            if smtp_user:
+                server.login(smtp_user, smtp_password)
+            server.sendmail(from_final, [to_addr], msg.as_string())
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            if smtp_user:
+                server.login(smtp_user, smtp_password)
+            server.sendmail(from_final, [to_addr], msg.as_string())
