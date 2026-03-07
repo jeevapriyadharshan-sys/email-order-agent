@@ -3,6 +3,8 @@ import ssl
 from email.mime.text import MIMEText
 from typing import Optional
 
+SMTP_TIMEOUT = 10  # seconds
+
 
 def send_confirmation(
     smtp_host: str,
@@ -38,12 +40,12 @@ def send_confirmation(
 
     # Use SSL (port 465) or STARTTLS (port 587)
     if smtp_port == 465:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=SMTP_TIMEOUT) as server:
             if smtp_user:
                 server.login(smtp_user, smtp_password)
             server.sendmail(from_final, [to_addr], msg.as_string())
     else:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=SMTP_TIMEOUT) as server:
             server.ehlo()
             server.starttls(context=context)
             server.ehlo()

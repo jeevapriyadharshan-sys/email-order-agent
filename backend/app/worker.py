@@ -37,6 +37,8 @@ def start_scheduler() -> None:
             seconds=15,
             id="agent-tick",
             replace_existing=True,
+            max_instances=3,
+            coalesce=True,
         )
         scheduler.start()
 
