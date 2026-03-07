@@ -1,9 +1,8 @@
-import smtplib
-import ssl
-from email.mime.text import MIMEText
+import os
+import json
+import urllib.request
+import urllib.error
 from typing import Optional
-
-SMTP_TIMEOUT = 15  # seconds
 
 
 def send_confirmation(
@@ -18,28 +17,51 @@ def send_confirmation(
     smtp_from: Optional[str] = None,
 ):
     """
-    Generic SMTP sender using Brevo (smtp-relay.brevo.com).
-    Works on Render free tier.
+    Sends email via Brevo HTTP API.
+    Works on Render free tier (no SMTP ports needed).
+    Requires BREVO_API_KEY environment variable.
     """
 
-    if not smtp_host or not to_addr:
+    if not to_addr:
         return
 
     from_final = (from_addr or smtp_from or smtp_user or "").strip()
     if not from_final:
         return
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["From"] = from_final
-    msg["To"] = to_addr
-    msg["Subject"] = subject
+    api_key = os.environ.get("BREVO_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("BREVO_API_KEY is not set. Cannot send email.")
 
-    context = ssl.create_default_context()
+    # Parse to_addr — handle "Name <email>" format
+    to_email = to_addr.strip()
+    to_name = ""
+    if "<" in to_addr and ">" in to_addr:
+        to_name = to_addr.split("<")[0].strip()
+        to_email = to_addr.split("<")[1].replace(">", "").strip()
 
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=SMTP_TIMEOUT) as server:
-        server.ehlo()
-        server.starttls(context=context)
-        server.ehlo()
-        if smtp_user and smtp_password:
-            server.login(smtp_user, smtp_password)
-        server.sendmail(from_final, [to_addr], msg.as_string())
+    payload = {
+        "sender": {"email": from_final},
+        "to": [{"email": to_email, "name": to_name or to_email}],
+        "subject": subject,
+        "textContent": body,
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "api-key": api_key,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        raise RuntimeError(f"Brevo API error {e.code}: {error_body}")
