@@ -52,7 +52,6 @@ def status(user=Depends(require_role("admin"))):
 
 @router.post("/test-imap")
 def test_imap(user=Depends(require_role("admin"))):
-    # Just try connecting and listing unseen count
     items = fetch_unseen_emails(settings.IMAP_HOST, settings.IMAP_USER, settings.IMAP_PASSWORD, settings.IMAP_FOLDER)
     return {"ok": True, "unseen_found": len(items)}
 
@@ -61,10 +60,12 @@ def test_smtp(user=Depends(require_role("admin"))):
     # Sends test mail to SMTP_USER (self-test)
     to = settings.SMTP_USER
     send_confirmation(
-        settings.SMTP_HOST, settings.SMTP_PORT,
-        settings.SMTP_USER, settings.SMTP_PASSWORD,
-        settings.SMTP_FROM,
+        smtp_host=settings.SMTP_HOST,
+        smtp_port=settings.SMTP_PORT,
+        smtp_user=settings.SMTP_USER,
+        smtp_password=settings.SMTP_PASSWORD,
         to_addr=to,
+        from_addr=settings.SMTP_FROM,
         subject="SMTP Test: Email Order Agent",
         body="SMTP Test OK. This is a connectivity test from the Email Order Agent dashboard."
     )
@@ -75,7 +76,6 @@ def test_gemini(user=Depends(require_role("admin"))):
     if not settings.GEMINI_API_KEY:
         return {"ok": False, "error": "GEMINI_API_KEY is empty"}
 
-    # Minimal smoke test without changing your extraction pipeline
     import google.generativeai as genai
     genai.configure(api_key=settings.GEMINI_API_KEY)
     model = genai.GenerativeModel(settings.GEMINI_MODEL)
