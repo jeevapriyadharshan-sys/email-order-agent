@@ -16,7 +16,7 @@ export default function Login() {
 localStorage.setItem("token", res.data.access_token);
 localStorage.setItem("role", res.data.role || "viewer");
 nav("/");
-    } catch {
+    } catch (err) {
       setErr("Invalid credentials");
     }
   }

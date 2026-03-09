@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..auth import get_current_user, require_role
 from ..db import get_db
-from ..models import EmailMessage, EmailStatus, ExtractionRun, HumanReview
+from ..models import EmailMessage, EmailStatus, ExtractionRun, HumanReview, Order
 from ..worker import process_email_task
 
 router = APIRouter(prefix="/emails", tags=["emails"])
@@ -26,10 +26,6 @@ ACTIVE_STATUSES = [
 
 
 def _has_archived_column() -> bool:
-    """
-    Safety helper: if the DB hasn't been altered yet (archived column missing),
-    we still don't want the whole API to crash.
-    """
     return hasattr(EmailMessage, "archived")
 
 
@@ -93,7 +89,7 @@ def get_email(
 
 
 # ---------------------------
-# Trigger processing manually (direct call, no Celery)
+# Trigger processing manually
 # ---------------------------
 @router.post("/{email_id}/process", response_model=None)
 def process_email_now(
@@ -105,13 +101,12 @@ def process_email_now(
     if not em:
         raise HTTPException(status_code=404, detail="Email not found")
 
-    # Direct call instead of .delay()
     process_email_task(email_id)
     return {"ok": True, "message": "Processing started", "email_id": email_id}
 
 
 # ---------------------------
-# Optional: Archive/unarchive manually
+# Archive/unarchive manually
 # ---------------------------
 @router.post("/{email_id}/archive", response_model=None)
 def archive_email(
@@ -144,12 +139,12 @@ def clear_inbox(
     user=Depends(require_role("admin")),
 ):
     """
-    Deletes all EmailMessage rows and their related
-    ExtractionRun + HumanReview records.
-    Orders table is NOT touched.
+    Deletes all inbox data in FK-safe order:
+    HumanReview -> ExtractionRun -> Order -> EmailMessage
     """
     db.query(HumanReview).delete(synchronize_session=False)
     db.query(ExtractionRun).delete(synchronize_session=False)
+    db.query(Order).delete(synchronize_session=False)
     db.query(EmailMessage).delete(synchronize_session=False)
     db.commit()
     return {"ok": True, "message": "Inbox cleared successfully"}
