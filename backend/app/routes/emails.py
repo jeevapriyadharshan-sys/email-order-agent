@@ -6,9 +6,9 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from ..auth import get_current_user
+from ..auth import get_current_user, require_role
 from ..db import get_db
-from ..models import EmailMessage, EmailStatus
+from ..models import EmailMessage, EmailStatus, ExtractionRun, HumanReview
 from ..worker import process_email_task
 
 router = APIRouter(prefix="/emails", tags=["emails"])
@@ -133,3 +133,23 @@ def archive_email(
     em.archived = bool(archived)
     db.commit()
     return {"ok": True, "email_id": email_id, "archived": em.archived}
+
+
+# ---------------------------
+# Clear inbox (admin only)
+# ---------------------------
+@router.delete("/clear-inbox", response_model=None)
+def clear_inbox(
+    db: Session = Depends(get_db),
+    user=Depends(require_role("admin")),
+):
+    """
+    Deletes all EmailMessage rows and their related
+    ExtractionRun + HumanReview records.
+    Orders table is NOT touched.
+    """
+    db.query(HumanReview).delete(synchronize_session=False)
+    db.query(ExtractionRun).delete(synchronize_session=False)
+    db.query(EmailMessage).delete(synchronize_session=False)
+    db.commit()
+    return {"ok": True, "message": "Inbox cleared successfully"}

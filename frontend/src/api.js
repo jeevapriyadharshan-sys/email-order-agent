@@ -9,3 +9,5 @@ api.interceptors.request.use((config) => {
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
+
+export const clearInbox = () => api.delete("/emails/clear-inbox");
