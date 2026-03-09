@@ -23,11 +23,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Email Processing & Order Creation Agent", lifespan=lifespan)
 
+# Build allowed origins — always include APP_BASE_URL plus common Render patterns
+_origins = [settings.APP_BASE_URL] if settings.APP_BASE_URL else []
+
+# Add trailing-slash variant in case it differs
+if settings.APP_BASE_URL and settings.APP_BASE_URL.endswith("/"):
+    _origins.append(settings.APP_BASE_URL.rstrip("/"))
+elif settings.APP_BASE_URL:
+    _origins.append(settings.APP_BASE_URL + "/")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.APP_BASE_URL],
+    allow_origins=_origins,
+    allow_origin_regex=r"https://.*\.onrender\.com",  # covers all Render subdomains
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
