@@ -15,43 +15,38 @@ from .email.imap_ingest import fetch_unseen_emails
 from .email.smtp_send import send_confirmation
 from .extraction.regex_layer import extract_with_regex
 
-# Gemini is optional; if import fails, we just skip that layer safely.
 try:
     from .extraction.gemini_layer import extract_with_gemini
 except Exception:
     extract_with_gemini = None  # type: ignore
 
-
-# ---------------------------------------------------------------------------
-# APScheduler setup (replaces Celery Beat)
-# ---------------------------------------------------------------------------
-scheduler = BackgroundScheduler(timezone="UTC")
+# ── Scheduler instance ────────────────────────────────────────────────────
+_scheduler: Optional[BackgroundScheduler] = None
 
 
-def start_scheduler() -> None:
-    """Call this once on FastAPI startup."""
-    if not scheduler.running:
-        scheduler.add_job(
-            agent_tick,
-            trigger="interval",
-            seconds=15,
-            id="agent-tick",
-            replace_existing=True,
-            max_instances=3,
-            coalesce=True,
-        )
-        scheduler.start()
+def start_scheduler():
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        return
+    _scheduler = BackgroundScheduler()
+    _scheduler.add_job(
+        agent_tick,
+        "interval",
+        seconds=15,
+        id="agent_tick",
+        max_instances=3,
+        coalesce=True,
+    )
+    _scheduler.start()
 
 
-def stop_scheduler() -> None:
-    """Call this on FastAPI shutdown."""
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
+def stop_scheduler():
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        _scheduler.shutdown(wait=False)
 
 
-# ---------------------------------------------------------------------------
-# Helpers (unchanged from original)
-# ---------------------------------------------------------------------------
+# ── Helpers ───────────────────────────────────────────────────────────────
 REQUIRED_FIELDS = [
     "customer_name",
     "weight_kg",
@@ -123,10 +118,10 @@ def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
     existing = db.query(Order).filter(Order.email_id == em.id).first()
 
     if existing:
-        existing.customer_name = str(ex.get("customer_name", "")).strip()
-        existing.weight_kg = weight_int
-        existing.pickup_location = str(ex.get("pickup_location", "")).strip()
-        existing.drop_location = str(ex.get("drop_location", "")).strip()
+        existing.customer_name      = str(ex.get("customer_name", "")).strip()
+        existing.weight_kg          = weight_int
+        existing.pickup_location    = str(ex.get("pickup_location", "")).strip()
+        existing.drop_location      = str(ex.get("drop_location", "")).strip()
         existing.pickup_time_window = str(ex.get("pickup_time_window", "")).strip()
         db.commit()
         db.refresh(existing)
@@ -241,9 +236,104 @@ def _send_missing_fields_request(db: Session, em: EmailMessage, missing: List[st
         db.commit()
 
 
-# ---------------------------------------------------------------------------
-# Core tasks (now plain functions, no Celery decorators)
-# ---------------------------------------------------------------------------
+# ── Core task functions (plain — no Celery) ───────────────────────────────
+
+def process_email_task(email_id: int) -> Dict[str, Any]:
+    db = SessionLocal()
+    try:
+        em: Optional[EmailMessage] = db.query(EmailMessage).get(email_id)
+        if not em:
+            return {"ok": False, "error": "Email not found"}
+
+        em.status = EmailStatus.EXTRACTING
+        em.last_error = ""
+        db.commit()
+
+        text = em.body_text or ""
+        # Start from whatever we already know (human review / previous run)
+        extracted: Dict[str, Any] = dict(em.extracted or {})
+
+        # --- Layer 1: Regex ---
+        try:
+            rex = extract_with_regex(text) or {}
+            extracted = _merge(extracted, rex)
+            db.add(ExtractionRun(
+                email_id=em.id,
+                layer="regex",
+                input_snapshot=_safe_json({"text": text[:2000]}),
+                output_snapshot=_safe_json({"extracted": extracted}),
+                created_at=_now(),
+            ))
+            db.commit()
+        except Exception as e:
+            em.last_error = f"Regex error: {str(e)}"
+            db.commit()
+
+        missing = _missing_fields(extracted)
+
+        # --- Layer 2: Gemini (only if fields still missing) ---
+        if missing and settings.GEMINI_API_KEY and extract_with_gemini is not None:
+            try:
+                gem = extract_with_gemini(
+                    text=text,
+                    partial=extracted,
+                    api_key=settings.GEMINI_API_KEY,
+                    model_name=settings.GEMINI_MODEL,
+                ) or {}
+                extracted = _merge(extracted, gem)
+                missing = _missing_fields(extracted)
+                db.add(ExtractionRun(
+                    email_id=em.id,
+                    layer="gemini",
+                    input_snapshot=_safe_json({"text": text[:2000]}),
+                    output_snapshot=_safe_json({"extracted": extracted}),
+                    created_at=_now(),
+                ))
+                db.commit()
+            except Exception as e:
+                em.last_error = (em.last_error + "\n" if em.last_error else "") + f"Gemini skipped: {str(e)}"
+                db.commit()
+
+        # Save extraction output
+        em.extracted = extracted
+        em.missing_fields = missing
+        db.commit()
+
+        # Still missing → human review
+        if missing:
+            em.status = EmailStatus.NEEDS_HUMAN_REVIEW
+            db.commit()
+            if not getattr(em, "missing_request_sent", False):
+                _send_missing_fields_request(db, em, missing)
+            _ensure_human_review_row(db, em.id)
+            return {"ok": True, "status": em.status, "missing_fields": missing}
+
+        # Complete → create order
+        em.status = EmailStatus.READY_TO_CONFIRM
+        db.commit()
+
+        order = _create_or_update_order(db, em)
+        em.status = EmailStatus.ORDER_CREATED
+        if hasattr(em, "archived"):
+            em.archived = True
+        db.commit()
+
+        _send_confirmation(db, em, order)
+
+        return {"ok": True, "status": em.status, "job_id": order.job_id}
+    except Exception as e:
+        try:
+            em = db.query(EmailMessage).get(email_id)
+            if em:
+                em.status = EmailStatus.FAILED
+                em.last_error = str(e)
+                db.commit()
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
 
 def ingest_emails_task() -> Dict[str, Any]:
     db = SessionLocal()
@@ -281,109 +371,11 @@ def ingest_emails_task() -> Dict[str, Any]:
             db.refresh(em)
             inserted += 1
 
-            # Call directly instead of .delay()
+            # Direct call — no Celery
             process_email_task(em.id)
 
         return {"ok": True, "inserted": inserted, "skipped": skipped}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
-    finally:
-        db.close()
-
-
-def process_email_task(email_id: int) -> Dict[str, Any]:
-    db = SessionLocal()
-    try:
-        em: Optional[EmailMessage] = db.query(EmailMessage).get(email_id)
-        if not em:
-            return {"ok": False, "error": "Email not found"}
-
-        em.status = EmailStatus.EXTRACTING
-        em.last_error = ""
-        db.commit()
-
-        text = em.body_text or ""
-        extracted: Dict[str, Any] = dict(em.extracted or {})
-
-        # --- Layer 1: Regex ---
-        try:
-            rex = extract_with_regex(text) or {}
-            extracted = _merge(extracted, rex)
-            db.add(
-                ExtractionRun(
-                    email_id=em.id,
-                    layer="regex",
-                    input_snapshot=_safe_json({"text": text[:2000]}),
-                    output_snapshot=_safe_json({"extracted": extracted}),
-                    created_at=_now(),
-                )
-            )
-            db.commit()
-        except Exception as e:
-            em.last_error = f"Regex error: {str(e)}"
-            db.commit()
-
-        missing = _missing_fields(extracted)
-
-        # --- Layer 2: Gemini (ONLY if missing + API key present) ---
-        if missing and settings.GEMINI_API_KEY and extract_with_gemini is not None:
-            try:
-                gem = extract_with_gemini(
-                    text=text,
-                    partial=extracted,
-                    api_key=settings.GEMINI_API_KEY,
-                    model_name=settings.GEMINI_MODEL,
-                ) or {}
-                extracted = _merge(extracted, gem)
-                missing = _missing_fields(extracted)
-                db.add(
-                    ExtractionRun(
-                        email_id=em.id,
-                        layer="gemini",
-                        input_snapshot=_safe_json({"text": text[:2000]}),
-                        output_snapshot=_safe_json({"extracted": extracted}),
-                        created_at=_now(),
-                    )
-                )
-                db.commit()
-            except Exception as e:
-                em.last_error = (em.last_error + "\n" if em.last_error else "") + f"Gemini skipped: {str(e)}"
-                db.commit()
-
-        em.extracted = extracted
-        em.missing_fields = missing
-        db.commit()
-
-        if missing:
-            em.status = EmailStatus.NEEDS_HUMAN_REVIEW
-            db.commit()
-            if not getattr(em, "missing_request_sent", False):
-                _send_missing_fields_request(db, em, missing)
-            _ensure_human_review_row(db, em.id)
-            return {"ok": True, "status": em.status, "missing_fields": missing}
-
-        em.status = EmailStatus.READY_TO_CONFIRM
-        db.commit()
-
-        order = _create_or_update_order(db, em)
-        em.status = EmailStatus.ORDER_CREATED
-
-        if hasattr(em, "archived"):
-            em.archived = True
-        db.commit()
-
-        _send_confirmation(db, em, order)
-
-        return {"ok": True, "status": em.status, "job_id": order.job_id}
-    except Exception as e:
-        try:
-            em = db.query(EmailMessage).get(email_id)
-            if em:
-                em.status = EmailStatus.FAILED
-                em.last_error = str(e)
-                db.commit()
-        except Exception:
-            pass
         return {"ok": False, "error": str(e)}
     finally:
         db.close()

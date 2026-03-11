@@ -1,3 +1,4 @@
+# backend/app/routes/review.py
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -34,7 +35,6 @@ def review_queue(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user)
 ):
-    # Only those still needing review
     emails = (
         db.query(EmailMessage)
         .filter(EmailMessage.status == EmailStatus.NEEDS_HUMAN_REVIEW)
@@ -58,20 +58,16 @@ def submit_review(
     # Merge proposed fields into extracted
     merged = {**(em.extracted or {}), **(payload.proposed_fields or {})}
     em.extracted = merged
-
-    # Recompute missing fields properly (IMPORTANT)
     em.missing_fields = compute_missing(em.extracted)
 
     # Upsert human review record
     hr = db.query(HumanReview).filter(HumanReview.email_id == email_id).first()
     if not hr:
         hr = HumanReview(email_id=email_id)
-
     hr.proposed_fields = payload.proposed_fields or {}
     hr.reviewer = payload.reviewer or ""
     hr.approved = True
 
-    # Update status based on completeness
     if len(em.missing_fields) == 0:
         em.status = EmailStatus.READY_TO_CONFIRM
     else:
@@ -81,7 +77,7 @@ def submit_review(
     db.add(hr)
     db.commit()
 
-    # If complete, continue pipeline (direct call, no Celery)
+    # ✅ Direct call — no .delay()
     if em.status == EmailStatus.READY_TO_CONFIRM:
         process_email_task(email_id)
 
