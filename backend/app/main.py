@@ -50,6 +50,6 @@ app.include_router(settings_route.router)
 app.include_router(activity.router)
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"ok": True}
