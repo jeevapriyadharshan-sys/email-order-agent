@@ -9,15 +9,7 @@ from .regex_layer import REQUIRED_FIELDS
 
 
 def _strip_code_fences(s: str) -> str:
-    """
-    Gemini sometimes returns:
-      ```json
-      {...}
-      ```
-    This removes those fences safely.
-    """
     s = (s or "").strip()
-    # remove triple backtick blocks
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
         s = re.sub(r"\s*```$", "", s)
@@ -28,17 +20,44 @@ def _safe_weight(v: Any):
     if v is None:
         return None
     if isinstance(v, (int, float)):
+        # Reject 0 or suspiciously low values
+        if float(v) <= 0:
+            return None
         return v
     if isinstance(v, str):
-        # extract first number from string like "55 kg"
+        v = v.strip()
+        if not v or v.lower() in ("unknown", "n/a", "null", "none", "not mentioned", "not provided", ""):
+            return None
         m = re.search(r"([0-9]+(?:\.[0-9]+)?)", v)
         if not m:
             return None
         try:
-            return float(m.group(1))
+            val = float(m.group(1))
+            if val <= 0:
+                return None
+            return val
         except Exception:
             return None
     return None
+
+
+def _is_hallucinated(field: str, value: Any) -> bool:
+    """
+    Detect common Gemini hallucination patterns.
+    Returns True if the value should be rejected.
+    """
+    if value is None:
+        return True
+    s = str(value).strip().lower()
+    # Reject placeholder/unknown values
+    if s in ("", "unknown", "n/a", "null", "none", "not mentioned",
+             "not provided", "not specified", "not available",
+             "to be confirmed", "tbd", "na", "-", "?"):
+        return True
+    # Reject if it looks like a template placeholder
+    if re.search(r"\[.*?\]|\{.*?\}", s):
+        return True
+    return False
 
 
 def extract_with_gemini(
@@ -50,8 +69,7 @@ def extract_with_gemini(
     """
     Gemini extraction layer (AI fallback).
     Returns a dict ONLY (no tuple).
-
-    If api_key is empty, returns partial unchanged.
+    Only fills fields that are EXPLICITLY present in the email.
     """
     partial = partial or {}
     if not api_key:
@@ -62,44 +80,70 @@ def extract_with_gemini(
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
 
+    # Identify which fields are still missing
+    missing = [
+        k for k in REQUIRED_FIELDS
+        if k not in partial or partial.get(k) in (None, "")
+    ]
+
     prompt = f"""
-Extract logistics order details from the email into JSON with keys:
-customer_name, weight_kg, pickup_location, drop_location, pickup_time_window.
-If unknown, set as empty string. Return ONLY JSON (no markdown).
+You are a strict data extractor for logistics transport requests.
+
+Extract ONLY the following fields from the email below:
+{json.dumps(missing)}
+
+CRITICAL RULES:
+1. Only extract values that are EXPLICITLY written in the email.
+2. Do NOT guess, infer, or assume any value.
+3. Do NOT use placeholder text like "unknown" or "N/A".
+4. If a field is not mentioned in the email, set it to null.
+5. For weight_kg: only extract if an explicit number with weight unit (kg, tons, etc.) is present. Return null if no weight is mentioned.
+6. Return ONLY a valid JSON object. No markdown, no explanation.
 
 EMAIL:
 {text}
 
-PARTIAL (regex extracted):
-{partial}
+Already extracted (do not change these):
+{json.dumps(partial)}
+
+Return JSON with only these keys: {json.dumps(missing)}
 """.strip()
 
-    resp = model.generate_content(prompt)
-    raw = getattr(resp, "text", "") or ""
-    cleaned = _strip_code_fences(raw)
-
-    ai_fields = json.loads(cleaned)
-    if not isinstance(ai_fields, dict):
-        raise ValueError("Gemini output is not a JSON object")
+    try:
+        resp = model.generate_content(prompt)
+        raw = getattr(resp, "text", "") or ""
+        cleaned = _strip_code_fences(raw)
+        ai_fields = json.loads(cleaned)
+        if not isinstance(ai_fields, dict):
+            raise ValueError("Gemini output is not a JSON object")
+    except Exception:
+        # If Gemini fails, return partial unchanged
+        return dict(partial)
 
     merged = dict(partial)
 
-    # Fill only missing/empty fields conservatively
-    for k, v in ai_fields.items():
-        if k not in REQUIRED_FIELDS:
+    # Fill only missing fields, with strict hallucination check
+    for k in missing:
+        if k not in ai_fields:
             continue
-        if v is None:
-            continue
-        if isinstance(v, str) and not v.strip():
-            continue
-        if k not in merged or merged.get(k) in (None, ""):
-            merged[k] = v
+        v = ai_fields[k]
 
-    # Normalize weight
-    if "weight_kg" in merged:
-        w = _safe_weight(merged["weight_kg"])
-        if w is not None:
-            # Keep as int if close to int, else float
-            merged["weight_kg"] = int(w) if abs(w - int(w)) < 1e-9 else w
+        # Reject hallucinated values
+        if _is_hallucinated(k, v):
+            continue
+
+        # Special handling for weight
+        if k == "weight_kg":
+            w = _safe_weight(v)
+            if w is not None:
+                merged[k] = int(w) if abs(w - int(w)) < 1e-9 else w
+            # If weight not valid, do NOT set it — leave it missing
+            continue
+
+        # For other fields, only accept non-empty strings
+        if isinstance(v, str) and v.strip():
+            merged[k] = v.strip()
+        elif v is not None and not isinstance(v, str):
+            merged[k] = v
 
     return merged
