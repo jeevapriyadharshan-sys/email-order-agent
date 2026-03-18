@@ -95,8 +95,16 @@ export default function Dashboard() {
     }
   }
 
-  async function start() { await api.post("/agent/start"); load(); }
-  async function stop()  { await api.post("/agent/stop");  load(); }
+  async function start() {
+    const res = await api.post("/agent/start");
+    setEnabled(res.data.enabled === true);
+    load();
+  }
+  async function stop() {
+    const res = await api.post("/agent/stop");
+    setEnabled(res.data.enabled === true);
+    load();
+  }
 
   useEffect(() => { load(); const t = setInterval(load, 15000); return () => clearInterval(t); }, []);
 
