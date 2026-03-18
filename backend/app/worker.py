@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import text
 from sqlalchemy.orm import Session
-from sqlalchemy.orm.attributes import flag_modified
 
 from .config import settings
 from .db import SessionLocal
@@ -22,7 +23,7 @@ try:
 except Exception:
     extract_with_gemini = None  # type: ignore
 
-# ── Scheduler instance ─────────────────────────────────────────────────────
+# ── Scheduler ──────────────────────────────────────────────────────────────
 _scheduler: Optional[BackgroundScheduler] = None
 
 
@@ -32,12 +33,8 @@ def start_scheduler():
         return
     _scheduler = BackgroundScheduler()
     _scheduler.add_job(
-        agent_tick,
-        "interval",
-        seconds=15,
-        id="agent_tick",
-        max_instances=3,
-        coalesce=True,
+        agent_tick, "interval", seconds=15,
+        id="agent_tick", max_instances=3, coalesce=True,
     )
     _scheduler.start()
 
@@ -48,13 +45,10 @@ def stop_scheduler():
         _scheduler.shutdown(wait=False)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────
 REQUIRED_FIELDS = [
-    "customer_name",
-    "weight_kg",
-    "pickup_location",
-    "drop_location",
-    "pickup_time_window",
+    "customer_name", "weight_kg",
+    "pickup_location", "drop_location", "pickup_time_window",
 ]
 
 
@@ -64,7 +58,6 @@ def _now() -> datetime:
 
 def _safe_json(obj: Any) -> Any:
     try:
-        import json
         json.dumps(obj)
         return obj
     except Exception:
@@ -83,7 +76,6 @@ def _missing_fields(extracted: Dict[str, Any]) -> List[str]:
 
 
 def _merge(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
-    """Conservative merge: fill only missing/empty fields."""
     out = dict(base or {})
     for k, v in (extra or {}).items():
         if v is None:
@@ -95,21 +87,36 @@ def _merge(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _set_extracted(db: Session, em: EmailMessage, extracted: Dict[str, Any]) -> None:
+def _save_extracted(db: Session, email_id: int,
+                    extracted: Dict, missing: List[str], status: str) -> None:
     """
-    Safely write extracted dict to the JSONB column.
-    SQLAlchemy won't detect in-place dict mutations on JSONB —
-    we must assign a brand-new dict and call flag_modified.
+    Use raw SQL to force-write JSONB columns.
+    This bypasses ALL SQLAlchemy change-tracking issues.
     """
-    em.extracted = copy.deepcopy(extracted)
-    flag_modified(em, "extracted")
-    db.add(em)
+    db.execute(
+        text("""
+            UPDATE emails
+               SET extracted      = CAST(:extracted AS jsonb),
+                   missing_fields = CAST(:missing   AS jsonb),
+                   status         = :status
+             WHERE id = :id
+        """),
+        {
+            "extracted": json.dumps(extracted),
+            "missing":   json.dumps(missing),
+            "status":    status,
+            "id":        email_id,
+        }
+    )
+    db.commit()
 
 
-def _set_missing(db: Session, em: EmailMessage, missing: List[str]) -> None:
-    em.missing_fields = list(missing)
-    flag_modified(em, "missing_fields")
-    db.add(em)
+def _set_status(db: Session, email_id: int, status: str, error: str = "") -> None:
+    db.execute(
+        text("UPDATE emails SET status = :s, last_error = :e WHERE id = :id"),
+        {"s": status, "e": error, "id": email_id}
+    )
+    db.commit()
 
 
 def _agent_enabled(db: Session) -> bool:
@@ -127,7 +134,6 @@ def _ensure_human_review_row(db: Session, email_id: int) -> None:
 
 def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
     ex = em.extracted or {}
-
     w = ex.get("weight_kg")
     try:
         weight_int = int(float(w)) if w not in (None, "") else 0
@@ -147,8 +153,7 @@ def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
 
     job_id = f"JOB-{_now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
     order = Order(
-        job_id=job_id,
-        email_id=em.id,
+        job_id=job_id, email_id=em.id,
         customer_name=str(ex.get("customer_name", "")).strip(),
         weight_kg=weight_int,
         pickup_location=str(ex.get("pickup_location", "")).strip(),
@@ -163,31 +168,26 @@ def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
 
 def _send_confirmation(db: Session, em: EmailMessage, order: Order) -> None:
     if not (settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASSWORD):
-        em.last_error = (em.last_error + "\n" if em.last_error else "") + "SMTP not configured; confirmation skipped."
-        db.commit()
+        _set_status(db, em.id, em.status,
+                    (em.last_error or "") + "\nSMTP not configured; confirmation skipped.")
         return
 
     to_addr = em.from_email
     if not to_addr or "@" not in to_addr:
-        em.last_error = (em.last_error + "\n" if em.last_error else "") + f"Invalid recipient '{to_addr}'; confirmation skipped."
-        db.commit()
         return
 
     ex = em.extracted or {}
     subject = f"Reconfirmation: Transport Order {order.job_id}"
     body = (
-        f"Hello,\n\n"
-        f"We received your transport request. Please reconfirm the details:\n\n"
+        f"Hello,\n\nWe received your transport request. Please reconfirm:\n\n"
         f"Job ID: {order.job_id}\n"
         f"Customer Name: {ex.get('customer_name')}\n"
         f"Weight (kg): {ex.get('weight_kg')}\n"
         f"Pickup Location: {ex.get('pickup_location')}\n"
         f"Drop Location: {ex.get('drop_location')}\n"
         f"Pickup Time Window: {ex.get('pickup_time_window')}\n\n"
-        f"Reply to this email if any detail is incorrect.\n\n"
-        f"Regards,\nEmail Order Agent\n"
+        f"Reply if any detail is incorrect.\n\nRegards,\nEmail Order Agent\n"
     )
-
     try:
         send_confirmation(
             smtp_host=settings.SMTP_HOST,
@@ -195,46 +195,31 @@ def _send_confirmation(db: Session, em: EmailMessage, order: Order) -> None:
             smtp_user=settings.SMTP_USER,
             smtp_password=settings.SMTP_PASSWORD,
             from_addr=(getattr(settings, "SMTP_FROM", "") or settings.SMTP_USER),
-            to_addr=to_addr,
-            subject=subject,
-            body=body,
+            to_addr=to_addr, subject=subject, body=body,
         )
-        em.status = EmailStatus.CONFIRMATION_SENT
-        db.commit()
+        _set_status(db, em.id, "CONFIRMATION_SENT")
     except Exception as e:
-        em.last_error = (em.last_error + "\n" if em.last_error else "") + f"SMTP error (confirmation skipped): {str(e)}"
-        db.commit()
+        _set_status(db, em.id, em.status,
+                    (em.last_error or "") + f"\nSMTP error: {str(e)}")
 
 
 def _send_missing_fields_request(db: Session, em: EmailMessage, missing: List[str]) -> None:
     if not (settings.SMTP_HOST and settings.SMTP_USER and settings.SMTP_PASSWORD):
-        em.last_error = (em.last_error + "\n" if em.last_error else "") + "SMTP not configured; missing-fields request skipped."
-        db.commit()
         return
-
     to_addr = em.from_email
     if not to_addr or "@" not in to_addr:
-        em.last_error = (em.last_error + "\n" if em.last_error else "") + f"Invalid recipient '{to_addr}'; missing-fields request skipped."
-        db.commit()
         return
 
     missing_list = "\n".join([f"- {m}" for m in missing])
     subject = "Action Required: Missing details for your transport request"
     body = (
-        "Hello,\n\n"
-        "We received your transport request but need the following details to proceed:\n\n"
+        "Hello,\n\nWe received your transport request but need:\n\n"
         f"{missing_list}\n\n"
-        "Please reply with the missing information in this format:\n\n"
-        "Customer Name: ...\n"
-        "Weight: ... kg\n"
-        "Pickup Location: ...\n"
-        "Drop Location: ...\n"
-        "Pickup Date: ...\n"
-        "Delivery Deadline: ...\n\n"
-        "Regards,\n"
-        "Email Order Agent\n"
+        "Please reply with:\nCustomer Name: ...\nWeight: ... kg\n"
+        "Pickup Location: ...\nDrop Location: ...\n"
+        "Pickup Date: ...\nDelivery Deadline: ...\n\n"
+        "Regards,\nEmail Order Agent\n"
     )
-
     try:
         send_confirmation(
             smtp_host=settings.SMTP_HOST,
@@ -242,19 +227,18 @@ def _send_missing_fields_request(db: Session, em: EmailMessage, missing: List[st
             smtp_user=settings.SMTP_USER,
             smtp_password=settings.SMTP_PASSWORD,
             from_addr=(getattr(settings, "SMTP_FROM", "") or settings.SMTP_USER),
-            to_addr=to_addr,
-            subject=subject,
-            body=body,
+            to_addr=to_addr, subject=subject, body=body,
         )
-        if hasattr(em, "missing_request_sent"):
-            em.missing_request_sent = True
+        db.execute(
+            text("UPDATE emails SET missing_request_sent = true WHERE id = :id"),
+            {"id": em.id}
+        )
         db.commit()
-    except Exception as e:
-        em.last_error = (em.last_error + "\n" if em.last_error else "") + f"Missing-fields email failed: {str(e)}"
-        db.commit()
+    except Exception:
+        pass
 
 
-# ── Core task (plain function — no Celery) ─────────────────────────────────
+# ── Core pipeline ──────────────────────────────────────────────────────────
 
 def process_email_task(email_id: int) -> Dict[str, Any]:
     db = SessionLocal()
@@ -263,99 +247,93 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
         if not em:
             return {"ok": False, "error": "Email not found"}
 
-        em.status = EmailStatus.EXTRACTING
-        em.last_error = ""
-        db.add(em)
-        db.commit()
-        db.refresh(em)
+        _set_status(db, email_id, "EXTRACTING", "")
+        db.expire(em)
+        em = db.query(EmailMessage).get(email_id)
 
-        text = em.body_text or ""
-        # Start from whatever we already know (human review / previous run)
+        text_body = em.body_text or ""
         extracted: Dict[str, Any] = copy.deepcopy(em.extracted or {})
 
         # --- Layer 1: Regex ---
         try:
-            rex = extract_with_regex(text) or {}
+            rex = extract_with_regex(text_body) or {}
             extracted = _merge(extracted, rex)
             db.add(ExtractionRun(
-                email_id=em.id,
-                layer="regex",
-                input_snapshot=_safe_json({"text": text[:2000]}),
+                email_id=em.id, layer="regex",
+                input_snapshot=_safe_json({"text": text_body[:2000]}),
                 output_snapshot=_safe_json({"extracted": extracted}),
                 created_at=_now(),
             ))
             db.commit()
         except Exception as e:
-            em.last_error = f"Regex error: {str(e)}"
-            db.add(em)
+            db.execute(text("UPDATE emails SET last_error = :e WHERE id = :id"),
+                       {"e": f"Regex error: {e}", "id": email_id})
             db.commit()
 
         missing = _missing_fields(extracted)
 
-        # --- Layer 2: Gemini (only if fields still missing) ---
+        # --- Layer 2: Gemini ---
         if missing and settings.GEMINI_API_KEY and extract_with_gemini is not None:
             try:
                 gem = extract_with_gemini(
-                    text=text,
-                    partial=extracted,
+                    text=text_body, partial=extracted,
                     api_key=settings.GEMINI_API_KEY,
                     model_name=settings.GEMINI_MODEL,
                 ) or {}
                 extracted = _merge(extracted, gem)
                 missing = _missing_fields(extracted)
                 db.add(ExtractionRun(
-                    email_id=em.id,
-                    layer="gemini",
-                    input_snapshot=_safe_json({"text": text[:2000]}),
+                    email_id=em.id, layer="gemini",
+                    input_snapshot=_safe_json({"text": text_body[:2000]}),
                     output_snapshot=_safe_json({"extracted": extracted}),
                     created_at=_now(),
                 ))
                 db.commit()
             except Exception as e:
-                em.last_error = (em.last_error + "\n" if em.last_error else "") + f"Gemini skipped: {str(e)}"
-                db.add(em)
+                db.execute(
+                    text("UPDATE emails SET last_error = :e WHERE id = :id"),
+                    {"e": f"Gemini skipped: {e}", "id": email_id}
+                )
                 db.commit()
 
-        # ✅ Save extraction output — use flag_modified to force JSONB update
-        _set_extracted(db, em, extracted)
-        _set_missing(db, em, missing)
-        db.commit()
-        db.refresh(em)
+        # ✅ Save with raw SQL — bypasses all JSONB tracking issues
+        new_status = "NEEDS_HUMAN_REVIEW" if missing else "READY_TO_CONFIRM"
+        _save_extracted(db, email_id, extracted, missing, new_status)
 
-        # Still missing → human review
+        # Reload fresh from DB
+        db.expire_all()
+        em = db.query(EmailMessage).get(email_id)
+
         if missing:
-            em.status = EmailStatus.NEEDS_HUMAN_REVIEW
-            db.add(em)
-            db.commit()
-            if not getattr(em, "missing_request_sent", False):
+            mr_sent = getattr(em, "missing_request_sent", False)
+            if not mr_sent:
                 _send_missing_fields_request(db, em, missing)
-            _ensure_human_review_row(db, em.id)
-            return {"ok": True, "status": em.status, "missing_fields": missing}
+            _ensure_human_review_row(db, email_id)
+            return {"ok": True, "status": new_status, "missing_fields": missing}
 
-        # Complete → create order
-        em.status = EmailStatus.READY_TO_CONFIRM
-        db.add(em)
-        db.commit()
+        # Create order
+        _set_status(db, email_id, "READY_TO_CONFIRM")
+        db.expire_all()
+        em = db.query(EmailMessage).get(email_id)
 
         order = _create_or_update_order(db, em)
-        em.status = EmailStatus.ORDER_CREATED
-        if hasattr(em, "archived"):
-            em.archived = True
-        db.add(em)
+        _set_status(db, email_id, "ORDER_CREATED")
+
+        db.execute(
+            text("UPDATE emails SET archived = true WHERE id = :id"),
+            {"id": email_id}
+        )
         db.commit()
 
+        db.expire_all()
+        em = db.query(EmailMessage).get(email_id)
         _send_confirmation(db, em, order)
 
-        return {"ok": True, "status": em.status, "job_id": order.job_id}
+        return {"ok": True, "status": "ORDER_CREATED", "job_id": order.job_id}
 
     except Exception as e:
         try:
-            em = db.query(EmailMessage).get(email_id)
-            if em:
-                em.status = EmailStatus.FAILED
-                em.last_error = str(e)
-                db.add(em)
-                db.commit()
+            _set_status(db, email_id, "FAILED", str(e))
         except Exception:
             pass
         return {"ok": False, "error": str(e)}
@@ -370,10 +348,8 @@ def ingest_emails_task() -> Dict[str, Any]:
             return {"ok": False, "error": "IMAP not configured"}
 
         items = fetch_unseen_emails(
-            host=settings.IMAP_HOST,
-            user=settings.IMAP_USER,
-            password=settings.IMAP_PASSWORD,
-            folder=settings.IMAP_FOLDER,
+            host=settings.IMAP_HOST, user=settings.IMAP_USER,
+            password=settings.IMAP_PASSWORD, folder=settings.IMAP_FOLDER,
         )
 
         inserted, skipped = 0, 0
@@ -390,15 +366,12 @@ def ingest_emails_task() -> Dict[str, Any]:
                 body_text=it.get("body_text", "") or "",
                 received_at=_now(),
                 status=EmailStatus.RECEIVED,
-                extracted={},
-                missing_fields=[],
-                last_error="",
+                extracted={}, missing_fields=[], last_error="",
             )
             db.add(em)
             db.commit()
             db.refresh(em)
             inserted += 1
-
             process_email_task(em.id)
 
         return {"ok": True, "inserted": inserted, "skipped": skipped}
@@ -413,7 +386,6 @@ def agent_tick() -> Dict[str, Any]:
     try:
         if not _agent_enabled(db):
             return {"ok": True, "message": "Agent disabled"}
-        res = ingest_emails_task()
-        return {"ok": True, "message": "Tick ok", "ingest": res}
+        return {"ok": True, "message": "Tick ok", "ingest": ingest_emails_task()}
     finally:
         db.close()
