@@ -1,12 +1,14 @@
 # backend/app/worker.py
 from __future__ import annotations
 
+import copy
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from .config import settings
 from .db import SessionLocal
@@ -20,7 +22,7 @@ try:
 except Exception:
     extract_with_gemini = None  # type: ignore
 
-# ── Scheduler instance ────────────────────────────────────────────────────
+# ── Scheduler instance ─────────────────────────────────────────────────────
 _scheduler: Optional[BackgroundScheduler] = None
 
 
@@ -46,7 +48,7 @@ def stop_scheduler():
         _scheduler.shutdown(wait=False)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────
 REQUIRED_FIELDS = [
     "customer_name",
     "weight_kg",
@@ -93,6 +95,23 @@ def _merge(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _set_extracted(db: Session, em: EmailMessage, extracted: Dict[str, Any]) -> None:
+    """
+    Safely write extracted dict to the JSONB column.
+    SQLAlchemy won't detect in-place dict mutations on JSONB —
+    we must assign a brand-new dict and call flag_modified.
+    """
+    em.extracted = copy.deepcopy(extracted)
+    flag_modified(em, "extracted")
+    db.add(em)
+
+
+def _set_missing(db: Session, em: EmailMessage, missing: List[str]) -> None:
+    em.missing_fields = list(missing)
+    flag_modified(em, "missing_fields")
+    db.add(em)
+
+
 def _agent_enabled(db: Session) -> bool:
     st = db.query(AgentState).first()
     return bool(st and st.enabled)
@@ -116,7 +135,6 @@ def _create_or_update_order(db: Session, em: EmailMessage) -> Order:
         weight_int = 0
 
     existing = db.query(Order).filter(Order.email_id == em.id).first()
-
     if existing:
         existing.customer_name      = str(ex.get("customer_name", "")).strip()
         existing.weight_kg          = weight_int
@@ -236,7 +254,7 @@ def _send_missing_fields_request(db: Session, em: EmailMessage, missing: List[st
         db.commit()
 
 
-# ── Core task functions (plain — no Celery) ───────────────────────────────
+# ── Core task (plain function — no Celery) ─────────────────────────────────
 
 def process_email_task(email_id: int) -> Dict[str, Any]:
     db = SessionLocal()
@@ -247,11 +265,13 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
 
         em.status = EmailStatus.EXTRACTING
         em.last_error = ""
+        db.add(em)
         db.commit()
+        db.refresh(em)
 
         text = em.body_text or ""
         # Start from whatever we already know (human review / previous run)
-        extracted: Dict[str, Any] = dict(em.extracted or {})
+        extracted: Dict[str, Any] = copy.deepcopy(em.extracted or {})
 
         # --- Layer 1: Regex ---
         try:
@@ -267,6 +287,7 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
             db.commit()
         except Exception as e:
             em.last_error = f"Regex error: {str(e)}"
+            db.add(em)
             db.commit()
 
         missing = _missing_fields(extracted)
@@ -292,16 +313,19 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
                 db.commit()
             except Exception as e:
                 em.last_error = (em.last_error + "\n" if em.last_error else "") + f"Gemini skipped: {str(e)}"
+                db.add(em)
                 db.commit()
 
-        # Save extraction output
-        em.extracted = extracted
-        em.missing_fields = missing
+        # ✅ Save extraction output — use flag_modified to force JSONB update
+        _set_extracted(db, em, extracted)
+        _set_missing(db, em, missing)
         db.commit()
+        db.refresh(em)
 
         # Still missing → human review
         if missing:
             em.status = EmailStatus.NEEDS_HUMAN_REVIEW
+            db.add(em)
             db.commit()
             if not getattr(em, "missing_request_sent", False):
                 _send_missing_fields_request(db, em, missing)
@@ -310,23 +334,27 @@ def process_email_task(email_id: int) -> Dict[str, Any]:
 
         # Complete → create order
         em.status = EmailStatus.READY_TO_CONFIRM
+        db.add(em)
         db.commit()
 
         order = _create_or_update_order(db, em)
         em.status = EmailStatus.ORDER_CREATED
         if hasattr(em, "archived"):
             em.archived = True
+        db.add(em)
         db.commit()
 
         _send_confirmation(db, em, order)
 
         return {"ok": True, "status": em.status, "job_id": order.job_id}
+
     except Exception as e:
         try:
             em = db.query(EmailMessage).get(email_id)
             if em:
                 em.status = EmailStatus.FAILED
                 em.last_error = str(e)
+                db.add(em)
                 db.commit()
         except Exception:
             pass
@@ -371,7 +399,6 @@ def ingest_emails_task() -> Dict[str, Any]:
             db.refresh(em)
             inserted += 1
 
-            # Direct call — no Celery
             process_email_task(em.id)
 
         return {"ok": True, "inserted": inserted, "skipped": skipped}
